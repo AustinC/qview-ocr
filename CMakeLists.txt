@@ -63,6 +63,7 @@ set(PROJECT_SOURCES
     src/actionmanager.cpp
     src/settingsmanager.cpp
     src/shortcutmanager.cpp
+    src/qvtextlayer.cpp
 )
 
 # Header files
@@ -81,6 +82,7 @@ set(PROJECT_HEADERS
     src/actionmanager.h
     src/settingsmanager.h
     src/shortcutmanager.h
+    src/qvtextlayer.h
 )
 
 # UI form files
@@ -138,6 +140,24 @@ if(WIN32)
     list(APPEND PROJECT_RESOURCES "${CMAKE_CURRENT_BINARY_DIR}/qView.rc")
 endif()
 add_executable(${PROJECT_NAME} ${EXECUTABLE_TYPE} ${PROJECT_SOURCES} ${PROJECT_HEADERS} ${PROJECT_FORMS} ${PROJECT_RESOURCES})
+
+# Rust OCR library (ocr-rs/), built with cargo as a static lib
+find_program(CARGO cargo REQUIRED)
+set(QVOCR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ocr-rs")
+set(QVOCR_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/cargo")
+set(QVOCR_LIB "${QVOCR_TARGET_DIR}/release/${CMAKE_STATIC_LIBRARY_PREFIX}qview_ocr${CMAKE_STATIC_LIBRARY_SUFFIX}")
+file(GLOB QVOCR_SOURCES "${QVOCR_DIR}/src/*.rs")
+add_custom_command(
+    OUTPUT "${QVOCR_LIB}"
+    COMMAND ${CARGO} build --release --lib --manifest-path "${QVOCR_DIR}/Cargo.toml" --target-dir "${QVOCR_TARGET_DIR}"
+    DEPENDS ${QVOCR_SOURCES} "${QVOCR_DIR}/Cargo.toml"
+    COMMENT "Building Rust OCR library"
+    USES_TERMINAL
+)
+add_custom_target(qview_ocr_rs DEPENDS "${QVOCR_LIB}")
+add_dependencies(${PROJECT_NAME} qview_ocr_rs)
+find_package(Threads REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE "${QVOCR_LIB}" Threads::Threads ${CMAKE_DL_LIBS})
 
 target_link_libraries(${PROJECT_NAME} PRIVATE Qt${QT_VERSION_MAJOR}::Core Qt${QT_VERSION_MAJOR}::Gui Qt${QT_VERSION_MAJOR}::Network Qt${QT_VERSION_MAJOR}::Widgets Qt${QT_VERSION_MAJOR}::Svg)
 
@@ -221,7 +241,8 @@ if(DEFINED NIGHTLY)
 endif()
 
 # Handle translations
-if(Qt${QT_VERSION_MAJOR}LinguistTools_FOUND)
+option(QV_BUILD_TRANSLATIONS "Build translations" ON)
+if(QV_BUILD_TRANSLATIONS AND Qt${QT_VERSION_MAJOR}LinguistTools_FOUND)
     message(STATUS "LinguistTools found, building translations.")
     file(GLOB TRANSLATIONS "i18n/qview_*.ts")
     if(QT_VERSION_MAJOR EQUAL 5)

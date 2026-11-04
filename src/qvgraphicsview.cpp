@@ -13,6 +13,10 @@
 #include <QtMath>
 #include <QGestureEvent>
 #include <QScrollBar>
+#include <QThread>
+#include <QSharedPointer>
+#include "qvtextlayer.h"
+#include "../ocr-rs/qvocr.h"
 
 QVGraphicsView::QVGraphicsView(QWidget *parent) : QGraphicsView(parent)
 {
@@ -58,6 +62,9 @@ QVGraphicsView::QVGraphicsView(QWidget *parent) : QGraphicsView(parent)
 
     loadedPixmapItem = new QGraphicsPixmapItem();
     scene->addItem(loadedPixmapItem);
+
+    // OCR overlay lives under the pixmap item so it follows pan/zoom/mirror
+    textLayer = new QVTextLayer(loadedPixmapItem);
 
     // Connect to settings signal
     connect(&qvApp->getSettingsManager(), &SettingsManager::settingsUpdated, this,
@@ -165,6 +172,31 @@ void QVGraphicsView::mousePressEvent(QMouseEvent *event)
         }
     }
 
+    if (event->button() == Qt::LeftButton && textLayer->hasText()) {
+        const QPointF pos = textLayerPos(event->pos());
+        if (textLayer->isOverText(pos)) {
+            if (lastDoubleClick.isValid()
+                && lastDoubleClick.elapsed() < QApplication::doubleClickInterval()) {
+                // triple click: whole line
+                textLayer->selectLineAt(pos);
+                lastDoubleClick.invalidate();
+                event->accept();
+                return;
+            }
+            const int caret = textLayer->caretAt(pos);
+            if (event->modifiers().testFlag(Qt::ShiftModifier) && textLayer->hasSelection()) {
+                textLayer->setSelection(selectionAnchor, caret);
+            } else {
+                selectionAnchor = caret;
+                textLayer->clearSelection();
+            }
+            selectingText = true;
+            event->accept();
+            return;
+        }
+        textLayer->clearSelection();
+    }
+
     QGraphicsView::mousePressEvent(event);
 }
 
@@ -184,15 +216,43 @@ void QVGraphicsView::mouseMoveEvent(QMouseEvent *event)
         return;
     }
 
+    if (selectingText) {
+        textLayer->setSelection(selectionAnchor, textLayer->caretAt(textLayerPos(event->pos())));
+        return;
+    }
+
     QGraphicsView::mouseMoveEvent(event);
+    if (event->buttons() == Qt::NoButton)
+        updateHoverCursor(event->pos());
 }
 
 void QVGraphicsView::mouseReleaseEvent(QMouseEvent *event)
 {
     mousePressButton = Qt::NoButton;
     mousePressModifiers = Qt::NoModifier;
+    if (selectingText) {
+        selectingText = false;
+        event->accept();
+        return;
+    }
     QGraphicsView::mouseReleaseEvent(event);
-    viewport()->setCursor(Qt::ArrowCursor);
+    updateHoverCursor(event->pos());
+}
+
+void QVGraphicsView::mouseDoubleClickEvent(QMouseEvent *event)
+{
+    if (event->button() == Qt::LeftButton && textLayer->hasText()) {
+        const QPointF pos = textLayerPos(event->pos());
+        if (textLayer->isOverText(pos)) {
+            // Swallow it so the window doesn't toggle fullscreen.
+            textLayer->selectWordAt(pos);
+            lastDoubleClick.start();
+            selectingText = false;
+            event->accept();
+            return;
+        }
+    }
+    QGraphicsView::mouseDoubleClickEvent(event);
 }
 
 bool QVGraphicsView::event(QEvent *event)
@@ -439,6 +499,7 @@ void QVGraphicsView::scaleExpensively()
 
     // Set image to scaled version
     loadedPixmapItem->setPixmap(imageCore.scaleExpensively(mappedPixmapSize));
+    syncTextLayerGeometry();
 
     // Reset transformation
     setTransform(
@@ -472,6 +533,7 @@ void QVGraphicsView::makeUnscaled()
         loadedPixmapItem->setPixmap(getLoadedMovie().currentPixmap());
     else
         loadedPixmapItem->setPixmap(getLoadedPixmap());
+    syncTextLayerGeometry();
 
     setTransform(absoluteTransform);
 
@@ -504,6 +566,7 @@ void QVGraphicsView::animatedFrameChanged(QRect rect)
         scaleExpensively();
     } else {
         loadedPixmapItem->setPixmap(getLoadedMovie().currentPixmap());
+        syncTextLayerGeometry();
     }
 }
 
@@ -512,6 +575,7 @@ void QVGraphicsView::updateLoadedPixmapItem()
     // set pixmap and offset
     loadedPixmapItem->setPixmap(getLoadedPixmap());
     scaledSize = loadedPixmapItem->boundingRect().size().toSize();
+    startOcr();
 
     resetScale();
 
@@ -809,4 +873,70 @@ void QVGraphicsView::setSpeed(const int &desiredSpeed)
 void QVGraphicsView::rotateImage(int rotation)
 {
     imageCore.rotateImage(rotation);
+}
+
+// OCR text selection
+
+bool QVGraphicsView::hasTextSelection() const
+{
+    return textLayer->hasSelection();
+}
+
+QString QVGraphicsView::selectedText() const
+{
+    return textLayer->selectedText();
+}
+
+void QVGraphicsView::startOcr()
+{
+    const quint64 generation = ++ocrGeneration;
+    textLayer->clear();
+    syncTextLayerGeometry();
+    updateHoverCursor(viewport()->mapFromGlobal(QCursor::pos()));
+
+    const auto &details = getCurrentFileDetails();
+    if (!details.isPixmapLoaded || details.isMovieLoaded)
+        return;
+
+    // QImage is implicitly shared, so handing a copy to the worker is cheap and safe.
+    const QImage image = getLoadedPixmap().toImage();
+    auto result = QSharedPointer<QByteArray>::create();
+    QThread *thread = QThread::create([image, result] {
+        const QImage rgba = image.convertToFormat(QImage::Format_RGBA8888);
+        char *json = qvocr_recognize_rgba(rgba.constBits(), uint32_t(rgba.width()),
+                                          uint32_t(rgba.height()),
+                                          uint32_t(rgba.bytesPerLine()));
+        *result = QByteArray(json);
+        qvocr_free_string(json);
+    });
+    // Receiver context = this, so the result is dropped if the view goes away.
+    connect(thread, &QThread::finished, this, [this, generation, result, size = image.size()] {
+        if (generation != ocrGeneration)
+            return; // a newer image superseded this run
+        textLayer->setOcrResult(*result, size);
+        syncTextLayerGeometry();
+        updateHoverCursor(viewport()->mapFromGlobal(QCursor::pos()));
+    });
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start(QThread::LowPriority);
+}
+
+void QVGraphicsView::syncTextLayerGeometry()
+{
+    // The displayed pixmap may be a pre-scaled copy; OCR coords are in source pixels.
+    const QSize source = textLayer->sourceSize();
+    if (source.isEmpty())
+        return;
+    textLayer->setScale(loadedPixmapItem->boundingRect().width() / source.width());
+}
+
+QPointF QVGraphicsView::textLayerPos(const QPoint &viewPos) const
+{
+    return textLayer->mapFromScene(mapToScene(viewPos));
+}
+
+void QVGraphicsView::updateHoverCursor(const QPoint &viewPos)
+{
+    const bool overText = textLayer->hasText() && textLayer->isOverText(textLayerPos(viewPos));
+    viewport()->setCursor(overText ? Qt::IBeamCursor : Qt::ArrowCursor);
 }

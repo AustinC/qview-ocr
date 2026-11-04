@@ -941,6 +941,12 @@ void MainWindow::undoDelete()
 
 void MainWindow::copy()
 {
+    // If OCR text is selected, copy that instead of the image.
+    if (graphicsView->hasTextSelection()) {
+        QApplication::clipboard()->setText(graphicsView->selectedText());
+        return;
+    }
+
     auto *mimeData = graphicsView->getMimeData();
     if (!mimeData->hasImage() || !mimeData->hasUrls()) {
         mimeData->deleteLater();

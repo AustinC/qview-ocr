@@ -8,6 +8,9 @@
 #include <QDir>
 #include <QTimer>
 #include <QFileInfo>
+#include <QElapsedTimer>
+
+class QVTextLayer;
 
 class QVGraphicsView : public QGraphicsView
 {
@@ -57,6 +60,10 @@ public:
     const QPixmap &getLoadedPixmap() const { return imageCore.getLoadedPixmap(); }
     const QMovie &getLoadedMovie() const { return imageCore.getLoadedMovie(); }
 
+    // OCR text selection
+    bool hasTextSelection() const;
+    QString selectedText() const;
+
 signals:
     void cancelSlideshow();
 
@@ -89,6 +96,8 @@ protected:
 
     void mouseReleaseEvent(QMouseEvent *event) override;
 
+    void mouseDoubleClickEvent(QMouseEvent *event) override;
+
     bool event(QEvent *event) override;
 
     void fitInViewMarginless(const QRectF &rect);
@@ -109,6 +118,17 @@ private slots:
 
 private:
     void updateFilteringMode();
+
+    void startOcr();
+    void syncTextLayerGeometry();
+    QPointF textLayerPos(const QPoint &viewPos) const;
+    void updateHoverCursor(const QPoint &viewPos);
+
+    QVTextLayer *textLayer;
+    quint64 ocrGeneration = 0;
+    bool selectingText = false;
+    int selectionAnchor = 0;
+    QElapsedTimer lastDoubleClick;
 
     QGraphicsPixmapItem *loadedPixmapItem;
 
